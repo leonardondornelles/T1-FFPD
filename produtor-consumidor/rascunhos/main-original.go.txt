@@ -1,0 +1,17 @@
+var wgProdutores sync.WaitGroup
+
+for cada produtor {
+    wgProdutores.Add(1)
+
+    go func() {
+        defer wgProdutores.Done()
+
+        // produzir itens
+        buffer <- item
+    }()
+}
+
+go func() {
+    wgProdutores.Wait()
+    close(buffer)
+}()
