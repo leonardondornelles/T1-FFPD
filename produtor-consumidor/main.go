@@ -20,16 +20,24 @@ type queue interface {
 	finish(int)
 }
 
-type channelQueue struct{ ch chan item }
+type channelQueue struct {
+	ch    chan item
+	meter *occupancyMeter
+}
 
-func (q *channelQueue) put(v item) { q.ch <- v }
+func (q *channelQueue) put(v item) {
+	q.ch <- v
+	q.meter.observe(len(q.ch))
+}
 func (q *channelQueue) get(timeout time.Duration) (item, bool, bool) {
 	if timeout == 0 {
 		v, ok := <-q.ch
+		q.meter.observe(len(q.ch))
 		return v, ok, false
 	}
 	select {
 	case v, ok := <-q.ch:
+		q.meter.observe(len(q.ch))
 		return v, ok, false
 	case <-time.After(timeout):
 		return item{}, true, true
@@ -40,8 +48,9 @@ func (q *channelQueue) finish(_ int)   { close(q.ch) }
 
 type config struct {
 	Mode                                          string
-	K, Producers, Consumers, Items                int
-	ProducerDelay, ConsumerDelay, Timeout, Sample time.Duration
+	K, Producers, Consumers, Items        int
+	ProducerDelay, ConsumerDelay, Timeout time.Duration
+	Occupancy                             bool
 }
 type result struct {
 	Mode          string       `json:"mode"`
@@ -54,8 +63,9 @@ type result struct {
 	Timeouts      []int        `json:"timeouts"`
 	Seconds       float64      `json:"seconds"`
 	Throughput    float64      `json:"throughput_items_s"`
-	MeanOccupancy float64      `json:"mean_occupancy_sampled"`
-	Samples       int          `json:"samples"`
+	MeanOccupancy float64      `json:"mean_occupancy"`
+	PeakOccupancy int          `json:"peak_occupancy"`
+	OccupancyWin  float64      `json:"occupancy_window_s"`
 	Verified      bool         `json:"verified"`
 	Atomic        *atomicCheck `json:"atomic_check,omitempty"`
 }
@@ -70,8 +80,8 @@ func (c config) validate() error {
 	if c.Items > int(^uint(0)>>1)/c.Producers {
 		return fmt.Errorf("p*n excede o limite de int")
 	}
-	if c.Timeout <= 0 || c.Sample <= 0 || c.ProducerDelay < 0 || c.ConsumerDelay < 0 {
-		return fmt.Errorf("timeout e sample devem ser positivos; atrasos não negativos")
+	if c.Timeout <= 0 || c.ProducerDelay < 0 || c.ConsumerDelay < 0 {
+		return fmt.Errorf("timeout deve ser positivo; atrasos não negativos")
 	}
 	return nil
 }
@@ -79,37 +89,18 @@ func run(c config) (result, error) {
 	if err := c.validate(); err != nil {
 		return result{}, err
 	}
+	meter := newOccupancyMeter(c.Occupancy)
 	var q queue
 	if c.Mode == "channel" {
-		q = &channelQueue{make(chan item, c.K)}
+		q = &channelQueue{make(chan item, c.K), meter}
 	} else {
-		q = newSemaphoreQueue(c.K)
+		q = newSemaphoreQueue(c.K, meter)
 	}
 	r := result{Mode: c.Mode, K: c.K, Producers: c.Producers, Consumers: c.Consumers, PerConsumer: make([]int, c.Consumers), Timeouts: make([]int, c.Consumers)}
 	ids := make([][]int, c.Consumers)
 	produced := make([]int, c.Producers)
+	meter.begin()
 	start := time.Now()
-	samplingDone := make(chan struct{})
-	var sampler sync.WaitGroup
-	sampler.Add(1)
-	go func() {
-		defer sampler.Done()
-		ticker := time.NewTicker(c.Sample)
-		defer ticker.Stop()
-		sum := 0
-		sample := func() { sum += q.occupancy(); r.Samples++ }
-		sample()
-		for {
-			select {
-			case <-ticker.C:
-				sample()
-			case <-samplingDone:
-				sample()
-				r.MeanOccupancy = float64(sum) / float64(r.Samples)
-				return
-			}
-		}
-	}()
 	var consumers, producers sync.WaitGroup
 	consumers.Add(c.Consumers)
 	for id := 0; id < c.Consumers; id++ {
@@ -150,11 +141,11 @@ func run(c config) (result, error) {
 		}(id)
 	}
 	producers.Wait()
+	meter.stop()
 	q.finish(c.Consumers)
 	consumers.Wait()
 	r.Seconds = time.Since(start).Seconds()
-	close(samplingDone)
-	sampler.Wait()
+	r.MeanOccupancy, r.PeakOccupancy, r.OccupancyWin = meter.result()
 	for _, n := range produced {
 		r.Produced += n
 	}
@@ -169,7 +160,10 @@ func run(c config) (result, error) {
 		}
 	}
 	r.Verified = r.Produced == r.Consumed && r.Consumed == len(seen) && q.occupancy() == 0
-	r.Throughput = float64(r.Consumed) / r.Seconds
+	// Execução curta demais para o relógio: throughput fica indefinido em vez de +Inf.
+	if r.Seconds > 0 {
+		r.Throughput = float64(r.Consumed) / r.Seconds
+	}
 	if reporter, isReporter := q.(integrityReporter); isReporter {
 		produced, consumed, valid := reporter.integrity()
 		r.Atomic = &atomicCheck{Produced: produced, Consumed: consumed, OK: valid}
@@ -192,9 +186,20 @@ func main() {
 	flag.DurationVar(&c.ProducerDelay, "producer-delay", 0, "atraso por produção")
 	flag.DurationVar(&c.ConsumerDelay, "consumer-delay", 0, "atraso por consumo")
 	flag.DurationVar(&c.Timeout, "timeout", 10*time.Millisecond, "espera do consumidor 0")
-	flag.DurationVar(&c.Sample, "sample", 100*time.Microsecond, "intervalo de amostragem da ocupação")
+	flag.BoolVar(&c.Occupancy, "occupancy", true, "medir ocupação (desligue para medir throughput sem interferência)")
 	asJSON := flag.Bool("json", false, "resultado JSON")
+	bench := flag.Bool("bench", false, "executa a matriz de experimentos (K=1,10,100 nas duas versões)")
+	benchReps := flag.Int("bench-reps", 5, "repetições por combinação no modo -bench")
+	benchJSONL := flag.String("bench-jsonl", "", "arquivo JSONL com os dados brutos do -bench")
 	flag.Parse()
+
+	if *bench {
+		if err := runBench(c, []string{"channel", "semaphore"}, []int{1, 10, 100}, *benchReps, *benchJSONL, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "Erro:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	r, err := run(c)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Erro:", err)
@@ -208,7 +213,10 @@ func main() {
 		return
 	}
 	fmt.Printf("Modo=%s K=%d | produzido=%d consumido=%d | verificação=%t\n", r.Mode, r.K, r.Produced, r.Consumed, r.Verified)
-	fmt.Printf("Tempo=%.6fs | throughput=%.2f itens/s | ocupação média amostrada=%.3f/%d (%d amostras)\n", r.Seconds, r.Throughput, r.MeanOccupancy, r.K, r.Samples)
+	fmt.Printf("Tempo=%.6fs | throughput=%.2f itens/s\n", r.Seconds, r.Throughput)
+	if r.OccupancyWin > 0 {
+		fmt.Printf("Ocupação média (ponderada no tempo)=%.3f/%d | pico=%d | janela=%.6fs\n", r.MeanOccupancy, r.K, r.PeakOccupancy, r.OccupancyWin)
+	}
 	if r.Atomic != nil {
 		fmt.Printf("Asserção atômica: totalProduzido(%d) == totalConsumido(%d) -> %t\n", r.Atomic.Produced, r.Atomic.Consumed, r.Atomic.OK)
 	}

@@ -7,7 +7,7 @@ import (
 )
 
 func TestSemaphoreAtomicCheck(t *testing.T) {
-	r, err := run(config{Mode: "semaphore", K: 10, Producers: 4, Consumers: 4, Items: 2500, Timeout: time.Millisecond, Sample: time.Millisecond})
+	r, err := run(config{Mode: "semaphore", K: 10, Producers: 4, Consumers: 4, Items: 2500, Timeout: time.Millisecond, Occupancy: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,7 +23,7 @@ func TestSemaphoreAtomicCheck(t *testing.T) {
 }
 
 func TestAtomicCheckAusenteNoChannel(t *testing.T) {
-	r, err := run(config{Mode: "channel", K: 10, Producers: 2, Consumers: 2, Items: 100, Timeout: time.Millisecond, Sample: time.Millisecond})
+	r, err := run(config{Mode: "channel", K: 10, Producers: 2, Consumers: 2, Items: 100, Timeout: time.Millisecond, Occupancy: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +34,7 @@ func TestAtomicCheckAusenteNoChannel(t *testing.T) {
 
 func TestSemaphoreFIFO(t *testing.T) {
 	const k = 4
-	q := newSemaphoreQueue(k)
+	q := newSemaphoreQueue(k, newOccupancyMeter(false))
 	for volta := 0; volta < 3; volta++ {
 		for i := 1; i <= k; i++ {
 			q.put(item{id: volta*k + i})
@@ -59,7 +59,7 @@ func TestSemaphoreFIFO(t *testing.T) {
 
 func TestSemaphoreOcupacaoLimitada(t *testing.T) {
 	const k, p, c, n = 4, 4, 4, 2000
-	q := newSemaphoreQueue(k)
+	q := newSemaphoreQueue(k, newOccupancyMeter(false))
 	parar := make(chan struct{})
 	erros := make(chan int, 1)
 	var vigia sync.WaitGroup

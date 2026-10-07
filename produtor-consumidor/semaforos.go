@@ -47,10 +47,13 @@ type semaphoreQueue struct {
 	_        [cacheLine]byte
 
 	count atomic.Int64
+
+	meter *occupancyMeter
 }
 
-func newSemaphoreQueue(k int) *semaphoreQueue {
+func newSemaphoreQueue(k int, meter *occupancyMeter) *semaphoreQueue {
 	return &semaphoreQueue{
+		meter:    meter,
 		notFull:  newSemaphore(k, k),
 		notEmpty: newSemaphore(k, 0),
 		buffer:   make([]item, k),
@@ -67,6 +70,7 @@ func (q *semaphoreQueue) put(v item) {
 	if !v.stop {
 		q.produced.Add(1)
 	}
+	q.meter.observe(int(q.count.Load()))
 	q.notEmpty.release()
 }
 
@@ -85,6 +89,7 @@ func (q *semaphoreQueue) get(timeout time.Duration) (item, bool, bool) {
 	if !v.stop {
 		q.consumed.Add(1)
 	}
+	q.meter.observe(int(q.count.Load()))
 	q.notFull.release()
 	return v, !v.stop, false
 }

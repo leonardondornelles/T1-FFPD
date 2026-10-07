@@ -5,22 +5,53 @@
 Duas estratégias compartilham configuração, carga e coleta de métricas. Cada
 produtor gera IDs exclusivos `idProdutor*n + índice`. O total esperado é `p*n`.
 Contagens e listas são exclusivas de cada goroutine e lidas depois dos WaitGroups.
-O amostrador é aguardado antes de ler suas métricas. A verificação final rejeita
-IDs fora do intervalo, duplicações, quantidade incorreta e buffer não vazio.
-Isso é mais forte que apenas comparar contagens, pois uma duplicação poderia
-compensar a perda de outro item.
+A verificação final rejeita IDs fora do intervalo, duplicações, quantidade incorreta
+e buffer não vazio. Isso é mais forte que apenas comparar contagens, pois uma
+duplicação poderia compensar a perda de outro item.
 
 Na versão channel, a capacidade K fornece a limitação e sincronização. O
 coordenador aguarda todos os produtores antes de fechar o canal; consumidores
 continuam até drenar os itens. Assim, não há envio em canal fechado.
 
-Na versão semáforos, `notFull` inicia com K permissões e `notEmpty` com zero.
-Produzir segue: adquirir notFull → mutex → inserir no índice tail → liberar
-mutex → sinalizar notEmpty. Consumir segue: adquirir notEmpty → mutex → retirar
-no índice head → liberar mutex → sinalizar notFull. Os índices avançam módulo K.
-O mutex protege buffer, índices e ocupação, que permanece entre zero e K.
-Durante operações em andamento há permissões reservadas: não se deve exigir que
-os comprimentos dos dois canais somem K em todo instante.
+Na versão semáforos (`semaforos.go`), `notFull` inicia com K permissões e
+`notEmpty` com zero. Produzir segue: adquirir notFull → `mutexIn` → inserir no
+índice `in` → liberar `mutexIn` → sinalizar notEmpty. Consumir segue: adquirir
+notEmpty → `mutexOut` → retirar no índice `out` → liberar `mutexOut` → sinalizar
+notFull. Os índices avançam módulo K. Durante operações em andamento há permissões
+reservadas: não se deve exigir que os comprimentos dos dois canais somem K em todo
+instante.
+
+Os **dois mutexes são independentes**, como pede o enunciado ao falar em exclusão
+mútua nas posições de escrita *e* de leitura: `mutexIn` serializa os produtores
+entre si, `mutexOut` serializa os consumidores entre si, e os dois lados nunca
+disputam o mesmo lock. Quem garante que produtor e consumidor não tocam a mesma
+posição são os semáforos, não os mutexes — notFull só libera um slot já consumido
+e notEmpty só libera um slot já escrito.
+
+Pela mesma razão, a **visibilidade de memória entre os dois lados vem dos
+semáforos**. Os mutexes são disjuntos e não estabelecem nenhuma relação entre um
+produtor e um consumidor. O que ordena as operações é o canal de permissões: o
+envio em notEmpty acontece depois da escrita e antes da recepção correspondente,
+e o modelo de memória de Go garante a relação happens-before nesse par. Na direção
+inversa, notFull ordena a limpeza do slot antes de ele ser reutilizado.
+
+Daí uma decisão que parece detalhe e não é: o item é copiado **dentro** de
+`mutexIn`, e não apenas o índice reservado. Se o produtor apenas reservasse o
+índice e escrevesse fora do lock, um produtor que pegou um índice maior poderia
+sinalizar notEmpty antes de um produtor com índice menor ter escrito, e o
+consumidor leria uma posição ainda vazia. Escrevendo sob o lock, a cadeia
+`escrita → unlock → lock → … → send → receive` encadeia também os produtores
+entre si.
+
+Os índices dos dois lados ficam separados por um bloco de preenchimento do tamanho
+de uma linha de cache. Sem essa separação, `mutexIn`/`in` e `mutexOut`/`out`
+cairiam na mesma linha e o falso compartilhamento anularia o ganho de ter dois
+mutexes — cada operação de um lado invalidaria a linha no núcleo do outro.
+
+A integridade é verificada por duas vias independentes: contadores `sync/atomic`
+mantidos pelas próprias operações do buffer (`integrity()`), e a contagem por IDs
+únicos feita em `run`. O programa imprime a asserção `totalProduzido ==
+totalConsumido` e falha com código diferente de zero se as duas vias divergirem.
 
 Depois de aguardar os produtores, o coordenador insere uma sentinela por
 consumidor. Como não há mais produção e o buffer é FIFO, nenhum item de trabalho
@@ -55,59 +86,157 @@ pressupõe que goroutines prontas eventualmente executem; não há garantia form
 de espera limitada nesta implementação. O consumidor 0 também paga o custo dos
 timers, tornando a distribuição assimétrica.
 
-## Efeito de K e metodologia
+## Metodologia de medição
 
-K=1 força coordenação frequente e pouco desacoplamento. K=10 e K=100 absorvem
-rajadas maiores e podem reduzir bloqueios. Aumentar K não garante maior
-throughput: o gargalo pode ser processamento, mutex, alocações, timers ou scheduler.
-Quando consumidores são lentos, a ocupação tende a subir; quando produtores são
-lentos, tende a cair. Memória do buffer cresce com K e filas maiores podem aumentar
-o tempo que um item espera; esta implementação não mede latência por item.
+Três decisões definem o que os números abaixo significam.
 
-O throughput considera itens reais consumidos divididos pelo tempo da simulação,
-incluindo inicialização e encerramento. A ocupação é uma média de amostras com
-intervalo solicitado de 100us, e não uma média temporal exata. Atrasos do scheduler,
-poucas amostras e sentinelas podem enviesá-la. A instrumentação também interfere
-na execução (mutex do amostrador, IDs armazenados e time.After). Portanto, estes
-resultados caracterizam o programa instrumentado, não o custo isolado da primitiva.
+**Throughput e ocupação são medidos em execuções separadas.** A instrumentação de
+ocupação pega um lock e lê o relógio a cada operação; medir as duas coisas na mesma
+execução faria o custo da medição entrar no resultado medido. Nas execuções de
+throughput a instrumentação fica desligada e nenhuma operação toca o relógio.
 
-Execute os comandos de experimentos do README, mantenha P, C, N, atrasos, versão do Go e ambiente
-constantes e compare repetições (média e dispersão). Separe cargas sem atraso,
-produção lenta e consumo lento. Use `-race` para validação; suas medições de tempo
-não devem ser misturadas às de execuções normais. A aprovação do detector cobre
-os entrelaçamentos executados, não é prova matemática de ausência de races.
+**A ocupação é uma integral no tempo, não uma média de amostras.** Cada operação
+informa ao medidor o nível resultante do buffer, que acumula `nível × tempo` desde
+a observação anterior; a média é a área dividida pela duração da janela. A primeira
+versão usava um ticker de 100us, mas o Windows entrega esse ticker a cada ~500us, o
+que rendia menos de 20 amostras por execução — base insuficiente para qualquer
+afirmação sobre ocupação. A janela fecha quando os produtores terminam, antes das
+sentinelas de encerramento, para que elas não inflem a média.
+
+**A carga precisa ser mensurável.** Com os 10.000 itens sugeridos, as combinações de
+K = 10 e K = 100 terminam em menos de um tique do relógio nesta máquina e o
+throughput ficaria indefinido. O programa detecta a condição e aborta pedindo `-n`
+maior, em vez de publicar um número inválido. A coleta abaixo usa 500.000 itens, com
+o que o desvio entre repetições cai para 1,5% a 6,5%.
+
+Cada combinação roda uma vez de aquecimento antes de medir, para que a primeira
+amostra não pague alocação e crescimento de heap. O tempo vai do início da simulação
+até o último consumidor terminar, incluindo criação de goroutines e encerramento.
+
+## Efeito de K: dados coletados
+
+Execução em 07/10/2026, Go 1.27.0, windows/amd64, AMD Ryzen 5 5600G (12 núcleos
+lógicos), sem `-race`. P = 4, C = 4, 500.000 itens por execução, sem atrasos, oito
+repetições por combinação. Dados brutos em `resultados.jsonl`. Todas as execuções
+verificaram produzido == consumido, sem IDs duplicados e com o buffer vazio ao final.
+
+| Versão | K | Throughput (itens/s) | Desvio | Ocupação média | Pico | Consumidor 0 / média |
+|---|---:|---:|---:|---:|---:|---:|
+| channel | 1 | 2.546.049 | 3,8% | 0,50 | 1 | 0,71 |
+| channel | 10 | 3.848.379 | 2,0% | 5,32 | 10 | 0,56 |
+| channel | 100 | 6.244.948 | 6,7% | 54,22 | 100 | 0,44 |
+| semaphore | 1 | 1.574.680 | 2,2% | 0,41 | 1 | 0,99 |
+| semaphore | 10 | 2.629.038 | 6,0% | 5,64 | 10 | 0,77 |
+| semaphore | 100 | 3.910.636 | 5,3% | 63,49 | 100 | 0,74 |
+
+**K desacopla os dois lados, e o efeito é grande.** De K = 1 para K = 100 o
+throughput cresce 2,5× nas duas versões. Com K = 1 cada item exige um encontro entre
+um produtor e um consumidor: o buffer não absorve nenhuma variação de ritmo e a
+ocupação média fica em 0,4–0,5, ou seja, o buffer passa a maior parte do tempo vazio
+esperando. Com K = 100 a ocupação média sobe para 54 (channel) e 63 (semáforos), e o
+pico encosta em K nas duas versões: o buffer vira de fato um amortecedor, e produtores
+deixam de bloquear a cada item.
+
+**O ganho não é proporcional a K.** De K = 1 para K = 10 o throughput cresce ~1,5–1,7×
+para um buffer dez vezes maior; de K = 10 para K = 100, ~1,5–1,6× para outro fator de
+dez. O gargalo migra da sincronização para o custo por item (escalonamento, cópia,
+contenção nos mutexes), que K nenhum elimina.
+
+**O channel é mais rápido que os semáforos em todos os K**, por um fator de 1,5×
+(K = 10) a 1,6× (K = 1 e K = 100). É o resultado esperado: o channel é uma primitiva
+do runtime, que entrega um item diretamente de um produtor a um consumidor em espera
+sem passar pelo buffer, enquanto a versão com semáforos paga, por item, duas operações
+de canal de permissões mais um mutex. A vantagem da versão com semáforos não é
+desempenho — é tornar o protocolo explícito, com cada passo do algoritmo clássico
+visível no código em vez de embutido na semântica da linguagem.
+
+**A ocupação média é sistematicamente maior na versão com semáforos** (63 contra 54
+em K = 100). O caminho de consumo é mais caro, os consumidores drenam mais devagar
+e a fila fica mais cheia. É a mesma causa do throughput menor, vista pelo outro lado.
+
+**A distribuição entre consumidores não é uniforme, e a causa é identificável.** A
+última coluna mostra quanto o consumidor 0 processa em relação à média dos quatro.
+O consumidor 0 é o que usa `select` com `time.After`, e aloca um timer novo a cada
+iteração do laço, mesmo quando há item disponível. Ele processa 44% a 71% da média no
+channel e 74% a 99% nos semáforos. O caso K = 1 com semáforos é o único em que a
+distribuição é praticamente perfeita (0,99): o buffer unitário serializa tanto o
+acesso que o custo do timer deixa de ser o fator dominante. Quanto maior K, maior o
+desequilíbrio — com mais folga, os consumidores sem timer avançam mais rápido.
+
+Esse desequilíbrio é consequência do requisito, não um defeito: o enunciado pede que
+pelo menos um consumidor use `select` com `time.After`, e é esse consumidor que paga
+a conta. Vale registrar que ele **não é starvation**: o consumidor 0 processa menos,
+mas processa continuamente e em volume comparável aos demais.
+
+## Limitações
+
+Os números caracterizam o programa instrumentado nesta máquina, não o custo isolado
+das primitivas. A verificação por IDs guarda uma lista por consumidor e usa memória
+O(p·n), o que afeta o desempenho das duas versões igualmente. A implementação não
+mede latência por item — um buffer maior aumenta o throughput, mas também o tempo que
+um item espera na fila, e esse custo não aparece nestas tabelas. Para reproduzir,
+mantenha P, C, N, atrasos, versão do Go e ambiente constantes, e não misture medições
+com e sem `-race`. A aprovação do detector de corridas cobre os entrelaçamentos que
+de fato ocorreram, não é prova de ausência de races.
+
+## Validação
+
+`go vet ./...` limpo e `go test ./... -count=25` sem falhas, cobrindo: K = 1, 10 e
+100; zero itens; menos itens que consumidores; parâmetros inválidos; timeouts
+seguidos de consumo; ordem FIFO do buffer circular em três voltas completas,
+exercitando o wrap-around; invariante de ocupação em [0, K] sob carga concorrente
+verificado por uma goroutine vigia; e a ponderação temporal do medidor de ocupação.
+
+**Detector de corridas:** `go test -race ./... -count=15` sem nenhum aviso, e
+`go run -race` nas duas versões com K = 1 e K = 100, todas verificando
+produzido == consumido. O consumo com timeout foi exercitado isoladamente com
+`-mode semaphore -p 1 -c 1 -n 10 -producer-delay 20ms -timeout 2ms`: 72 timeouts
+registrados e os 10 itens consumidos, confirmando que o timeout aciona o caminho
+alternativo sem encerrar o consumidor nem descartar itens.
+
+Em windows/amd64 o detector exige cgo e um compilador C; esta validação usou
+LLVM-MinGW (clang 22.1.8, target x86_64-w64-windows-gnu) com `CGO_ENABLED=1`.
+A aprovação do detector cobre os entrelaçamentos que de fato ocorreram nas
+execuções, e não constitui prova de ausência de corridas.
+
+A parte de filósofos permaneceu inalterada; o teste do módulo compila esse pacote,
+mas não exercita seu protocolo.
 
 ## Uso de IA
 
-Esta integração foi gerada com assistência do Codex a partir dos requisitos do
-usuário. A IA inspecionou a estrutura, preservou a implementação de filósofos e
-copiou o rascunho anterior para `rascunhos/main-original.go.txt`; implementou as
-duas estratégias, testes, script e documentação. O histórico disponibilizado não
-incluía o código completo anterior, então não se afirma reprodução literal dele.
-O autor do trabalho deve revisar, compreender e explicar o código e complementar
-este registro com as regras da disciplina e com suas próprias alterações.
+**Versão com channel, encerramento ordenado e consumo com timeout:** gerada com
+assistência do Codex a partir dos requisitos do usuário. A IA inspecionou a
+estrutura, preservou a implementação de filósofos e copiou o rascunho anterior para
+`rascunhos/main-original.go.txt`; implementou a estratégia, testes e documentação.
 
-## Experimento executado nesta integração
+**Versão com semáforos, instrumentação e experimentos:** desenvolvida com assistência
+do Claude (Claude Code), nas seguintes etapas:
 
-Execução em 07/10/2026, Go 1.27.1, darwin/amd64, sem `-race`.
-P=2, C=3, N=5000 por produtor, sem atrasos; três repetições por combinação.
-Dados brutos: `resultados-exemplo.jsonl`. Todas as 18 execuções verificaram
-10.000 itens produzidos e consumidos, sem duplicações.
+- *Projeto da solução:* discussão do algoritmo clássico com dois mutexes, da origem
+  da relação happens-before entre produtor e consumidor e da necessidade de escrever
+  o item sob `mutexIn`.
+- *Geração de código:* `semaforos.go`, `metricas.go`, `bench.go` e os respectivos
+  testes.
+- *Depuração:* diagnóstico de dois defeitos de medição — o ticker de 100us entregue
+  em ~500us e o throughput `+Inf` em execuções abaixo da resolução do relógio — com
+  medições feitas para confirmar cada hipótese antes da correção.
+- *Análise dos dados:* execução da matriz de experimentos e interpretação dos
+  resultados.
+- *Redação:* este documento e as seções correspondentes do README.
 
-| Versão | K | Throughput médio (itens/s) | Mín.–máx. (itens/s) | Ocupação média amostrada |
-|---|---:|---:|---:|---:|
-| channel | 1 | 1596360 | 1542401–1624084 | 0.44 |
-| channel | 10 | 2648452 | 2596894–2729495 | 4.25 |
-| channel | 100 | 4185759 | 4055816–4302228 | 39.19 |
-| semaphore | 1 | 829441 | 774489–856963 | 0.40 |
-| semaphore | 10 | 1781580 | 1728078–1862720 | 4.97 |
-| semaphore | 100 | 2619743 | 2531319–2672688 | 36.92 |
+Todas as decisões de projeto foram revisadas e são de responsabilidade do autor, que
+deve ser capaz de explicar qualquer linha do código e qualquer número das tabelas.
 
-Estas execuções curtas são uma demonstração reproduzível da coleta, não um
-benchmark conclusivo. A dispersão e a baixa quantidade de amostras limitam a
-interpretação da ocupação. Repita com cargas mais longas e atrasos controlados
-antes de concluir que uma estratégia ou capacidade é superior.
+## Referências
 
-Validação: `go test -race ./... -count=1 -timeout=60s`, `go vet ./...` e
-`go run -race` nas duas versões com K=1. A parte de filósofos permaneceu
-inalterada; o teste do módulo compila esse pacote, mas não exercita seu protocolo.
+- Go Memory Model — https://go.dev/ref/mem — usado para fundamentar a afirmação de
+  que o envio em um canal ocorre antes da conclusão da recepção correspondente, que é
+  a garantia de visibilidade entre produtor e consumidor nesta implementação.
+- Documentação dos pacotes `sync`, `sync/atomic` e `time` — https://pkg.go.dev/sync,
+  https://pkg.go.dev/sync/atomic, https://pkg.go.dev/time
+- Material da disciplina sobre o problema do buffer limitado com semáforos de
+  contagem e exclusão mútua nas posições de escrita e leitura.
+
+> Conferir esta lista antes da entrega: a regra 6 do enunciado exige que **toda**
+> fonte efetivamente consultada seja referenciada, e deixar de citar uma é tratado
+> como plágio. Acrescente aqui os materiais que cada integrante consultou.
