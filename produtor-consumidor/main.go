@@ -38,80 +38,26 @@ func (q *channelQueue) get(timeout time.Duration) (item, bool, bool) {
 func (q *channelQueue) occupancy() int { return len(q.ch) }
 func (q *channelQueue) finish(_ int)   { close(q.ch) }
 
-// Os canais carregam permissões; os itens ficam exclusivamente no buffer circular.
-type semaphoreQueue struct {
-	notEmpty, notFull chan struct{}
-	mutex             sync.Mutex
-	buffer            []item
-	head, tail, size  int
-}
-
-func newSemaphoreQueue(k int) *semaphoreQueue {
-	q := &semaphoreQueue{notEmpty: make(chan struct{}, k), notFull: make(chan struct{}, k), buffer: make([]item, k)}
-	for i := 0; i < k; i++ {
-		q.notFull <- struct{}{}
-	}
-	return q
-}
-func (q *semaphoreQueue) put(v item) {
-	<-q.notFull // Nunca esperar uma permissão segurando o mutex.
-	q.mutex.Lock()
-	q.buffer[q.tail] = v
-	q.tail = (q.tail + 1) % len(q.buffer)
-	q.size++
-	q.mutex.Unlock()
-	q.notEmpty <- struct{}{}
-}
-func (q *semaphoreQueue) get(timeout time.Duration) (item, bool, bool) {
-	if timeout == 0 {
-		<-q.notEmpty
-	} else {
-		select {
-		case <-q.notEmpty:
-		case <-time.After(timeout):
-			return item{}, true, true
-		}
-	}
-	q.mutex.Lock()
-	v := q.buffer[q.head]
-	q.buffer[q.head] = item{}
-	q.head = (q.head + 1) % len(q.buffer)
-	q.size--
-	q.mutex.Unlock()
-	q.notFull <- struct{}{}
-	return v, !v.stop, false
-}
-func (q *semaphoreQueue) occupancy() int {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-	return q.size
-}
-func (q *semaphoreQueue) finish(consumers int) {
-	// Produtores já terminaram: uma sentinela FIFO para cada consumidor.
-	for i := 0; i < consumers; i++ {
-		q.put(item{stop: true})
-	}
-}
-
 type config struct {
 	Mode                                          string
 	K, Producers, Consumers, Items                int
 	ProducerDelay, ConsumerDelay, Timeout, Sample time.Duration
 }
 type result struct {
-	Mode          string  `json:"mode"`
-	K             int     `json:"k"`
-	Producers     int     `json:"producers"`
-	Consumers     int     `json:"consumers"`
-	Produced      int     `json:"produced"`
-	Consumed      int     `json:"consumed"`
-	PerConsumer   []int   `json:"per_consumer"`
-	Timeouts      []int   `json:"timeouts"`
-	Seconds       float64 `json:"seconds"`
-	Throughput    float64 `json:"throughput_items_s"`
-	MeanOccupancy float64 `json:"mean_occupancy_sampled"`
-	Samples       int     `json:"samples"`
-	Verified      bool    `json:"verified"`
+	Mode          string       `json:"mode"`
+	K             int          `json:"k"`
+	Producers     int          `json:"producers"`
+	Consumers     int          `json:"consumers"`
+	Produced      int          `json:"produced"`
+	Consumed      int          `json:"consumed"`
+	PerConsumer   []int        `json:"per_consumer"`
+	Timeouts      []int        `json:"timeouts"`
+	Seconds       float64      `json:"seconds"`
+	Throughput    float64      `json:"throughput_items_s"`
+	MeanOccupancy float64      `json:"mean_occupancy_sampled"`
+	Samples       int          `json:"samples"`
+	Verified      bool         `json:"verified"`
+	Atomic        *atomicCheck `json:"atomic_check,omitempty"`
 }
 
 func (c config) validate() error {
@@ -224,6 +170,13 @@ func run(c config) (result, error) {
 	}
 	r.Verified = r.Produced == r.Consumed && r.Consumed == len(seen) && q.occupancy() == 0
 	r.Throughput = float64(r.Consumed) / r.Seconds
+	if reporter, isReporter := q.(integrityReporter); isReporter {
+		produced, consumed, valid := reporter.integrity()
+		r.Atomic = &atomicCheck{Produced: produced, Consumed: consumed, OK: valid}
+		if !valid || produced != int64(r.Produced) {
+			return r, fmt.Errorf("asserção atômica falhou: totalProduzido=%d totalConsumido=%d", produced, consumed)
+		}
+	}
 	if !r.Verified {
 		return r, fmt.Errorf("verificação falhou: produzido=%d consumido=%d esperado=%d", r.Produced, r.Consumed, len(seen))
 	}
@@ -256,6 +209,9 @@ func main() {
 	}
 	fmt.Printf("Modo=%s K=%d | produzido=%d consumido=%d | verificação=%t\n", r.Mode, r.K, r.Produced, r.Consumed, r.Verified)
 	fmt.Printf("Tempo=%.6fs | throughput=%.2f itens/s | ocupação média amostrada=%.3f/%d (%d amostras)\n", r.Seconds, r.Throughput, r.MeanOccupancy, r.K, r.Samples)
+	if r.Atomic != nil {
+		fmt.Printf("Asserção atômica: totalProduzido(%d) == totalConsumido(%d) -> %t\n", r.Atomic.Produced, r.Atomic.Consumed, r.Atomic.OK)
+	}
 	for id, n := range r.PerConsumer {
 		fmt.Printf("Consumidor %d: %d itens, %d timeouts\n", id, n, r.Timeouts[id])
 	}
