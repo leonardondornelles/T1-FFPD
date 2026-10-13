@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -95,16 +96,18 @@ func philosopher(
 
 		/*
 			- Estratégia 1: Deadlock
-			- O programa trava rapidamente e exibe um erro de runtime:
-			- fatal error: all goroutines are asleep - deadlock!
+			- A mesa trava já na primeira rodada. Como ninguém mais come, o watchdog
+			- detecta o travamento após 2s, cancela a mesa e o programa encerra de forma
+			- ordenada (sem o "fatal error: all goroutines are asleep" do runtime)
 			-
 			- Por que acontece (Teoria de Coffman):
 			-
 			- Todos os 5 filósofos pegam simultaneamente o garfo da esquerda
 			- pickUp(leftFork)
 			-
-			- O time.Sleep garante que todos terminem de pegaro primeiro garfo antes que
-			- qualquer um tente pegar o segundo
+			- O time.Sleep garante que todos terminem de pegar o primeiro garfo antes que
+			- qualquer um tente pegar o segundo: o tempo de pensar varia no máximo 10ms
+			- entre os filósofos (jitter em [5, 15]ms), menos que os 20ms de espera
 			-
 			- Agora, cada filósofo está segurando seu garfo esquerdo e tentando pegar o
 			- direito com pickUp(rightFork)
@@ -113,8 +116,7 @@ func philosopher(
 			- i + 1, que já está ocupado
 			-
 			- Fecha-se uma ESPERA CIRCULAR (circular wait): ninguém avança e ninguém solta
-			- o garfo que possui (Hold and Wait). O Go detecta que todas as goroutines
-			- estão bloqueadas em canais sem nenhum produtor ativo e aborta a execução
+			- o garfo que possui (Hold and Wait)
 		*/
 
 		case "deadlock":
@@ -246,9 +248,20 @@ func main() {
 	strategy := flag.String("strategy", "hierarchy", "Estratégia: deadlock, hierarchy, conductor")
 	flag.Parse()
 
+	// Parâmetros inválidos encerram aqui, antes de criar qualquer goroutine
 	if *n < 2 {
-		fmt.Println("Erro: O número de filósofos deve ser pelo menos 2.")
-		return
+		fmt.Fprintln(os.Stderr, "Erro: o número de filósofos (-n) deve ser pelo menos 2.")
+		os.Exit(2)
+	}
+	if *r < 1 {
+		fmt.Fprintln(os.Stderr, "Erro: o número de refeições (-r) deve ser pelo menos 1.")
+		os.Exit(2)
+	}
+	switch *strategy {
+	case "deadlock", "hierarchy", "conductor":
+	default:
+		fmt.Fprintf(os.Stderr, "Erro: estratégia desconhecida %q (use deadlock, hierarchy ou conductor).\n", *strategy)
+		os.Exit(2)
 	}
 
 	fmt.Printf("Iniciando simulação: N=%d, R=%d, Estratégia=%s\n", *n, *r, *strategy)
@@ -327,7 +340,7 @@ func main() {
 	}
 	fmt.Println("Todos os filósofos concluíram suas refeições com sucesso!")
 
-	// Tabela mastigada para a Pessoa 2 colocar direto no relatório/planilha
+	// Dados de fairness: refeições e tempo de espera pelos garfos de cada filósofo
 	fmt.Println("=== DADOS DE EXECUÇÃO (FAIRNESS) ===")
 	fmt.Printf("%-12s | %-10s | %-18s | %-18s\n", "Filósofo ID", "Refeições", "Espera Média", "Espera Máxima")
 	fmt.Println("--------------------------------------------------------------------")

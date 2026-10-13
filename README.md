@@ -4,6 +4,14 @@ Trabalho em Go: filósofos (`filosofos/`) e produtor/consumidor (`produtor-consu
 O rascunho anterior de produtor/consumidor está em `produtor-consumidor/rascunhos/`.
 O relatório final é o PDF entregue junto com o código.
 
+## Requisitos
+
+Go 1.22 ou superior, sem dependências externas. Execute os comandos na raiz do projeto.
+
+O race detector (`-race`) exige cgo e um compilador C. Em Windows, LLVM-MinGW, WinLibs
+ou MSYS2 resolvem; extraia o zip do LLVM-MinGW com `tar -xf` (segundos) em vez do
+winget, e exporte `CGO_ENABLED=1` com o `bin` dele no PATH.
+
 ## Problema 1 — Jantar dos Filósofos
 
 ```sh
@@ -13,7 +21,8 @@ go run -race ./filosofos -n 5 -r 200 -strategy conductor
 ```
 
 `-n` é o número de filósofos (padrão 5), `-r` o número de refeições por filósofo
-(padrão 100) e `-strategy` uma de `deadlock`, `hierarchy` ou `conductor`.
+(padrão 100) e `-strategy` uma de `deadlock`, `hierarchy` ou `conductor`. Parâmetros
+inválidos (`-n` < 2, `-r` < 1 ou estratégia desconhecida) encerram com código 2.
 
 Cada garfo é um `chan struct{}` com buffer 1. Pegar o garfo é um `select` entre o envio
 no garfo e o canal `done`; um watchdog fecha `done` se nenhuma refeição começar por 2s.
@@ -23,9 +32,7 @@ vez de abortar com `fatal error`. Os tempos de pensar e comer são sorteados em
 
 ## Problema 2 — Produtor/Consumidor
 
-### Requisitos e execução
-
-Go 1.22 ou superior. Sem dependências externas. Execute na raiz do projeto:
+### Execução
 
 ```sh
 go run ./produtor-consumidor -mode channel -k 10 -p 4 -c 4 -n 2500
@@ -36,7 +43,6 @@ go run ./produtor-consumidor -bench -p 4 -c 4 -n 125000
 `-n` é o número de itens **por produtor**; o total é `p*n`. `-k` deve ser pelo
 menos 1; produtores e consumidores devem ser positivos; `-n 0` é permitido.
 Use `go run ./produtor-consumidor -h` para consultar as opções.
-Também é possível executar `go run produtor-consumidor/main.go`.
 
 - `channel`: channel de itens com capacidade K, fechado somente depois de todos os produtores terminarem. Consumidores drenam o channel e saem ao receber `ok=false`.
 - `semaphore`: buffer circular com semáforos de contagem `notEmpty` (inicialmente 0) e `notFull` (inicialmente K), implementados com canais de permissões, e **dois mutexes independentes** — `mutexIn` serializa os produtores no índice de escrita, `mutexOut` serializa os consumidores no índice de leitura. Produtores e consumidores nunca disputam o mesmo lock. Após a produção, insere uma sentinela por consumidor; cada consumidor sai ao retirar sua sentinela. Os semáforos não são fechados. Implementação em `produtor-consumidor/semaforos.go`.
@@ -53,9 +59,6 @@ go run -race ./produtor-consumidor -mode semaphore -k 1 -p 4 -c 4 -n 2500
 go run -race ./produtor-consumidor -mode semaphore -p 1 -c 1 -n 10 -producer-delay 20ms -timeout 2ms
 ```
 
-O detector exige cgo e um compilador C. Em Windows, LLVM-MinGW ou MSYS2 resolvem;
-extraia o zip do LLVM-MinGW com `tar -xf` (segundos) em vez do winget, e exporte
-`CGO_ENABLED=1` com o `bin` dele no PATH.
 A execução só é bem-sucedida se `produzido == consumido == p*n`, não houver IDs
 inválidos/duplicados e o buffer terminar vazio. Falhas retornam código diferente de zero.
 Os testes incluem K=1,10,100, múltiplos produtores/consumidores, zero itens,
@@ -104,5 +107,3 @@ nenhuma operação toca o relógio nem o lock.
 Para experimentar velocidades diferentes, acrescente `-consumer-delay 100us` ou
 `-producer-delay 100us`, mantendo a mesma configuração nas comparações. Não compare
 o desempenho de execuções com e sem `-race`.
-
-Consulte `produtor-consumidor/RELATORIO-PROBLEMA-2.md` para a análise.
