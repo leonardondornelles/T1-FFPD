@@ -127,4 +127,3 @@ func stddev(xs []float64) float64 {
 	}
 	return math.Sqrt(sum / float64(len(xs)-1))
 }
-

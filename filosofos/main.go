@@ -3,7 +3,9 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,8 +18,19 @@ type Fork chan struct{}
 - cheio e quem tentar enviar bloqueia até o canal esvaziar com putDown
 */
 
-func pickUp(f Fork) {
-	f <- struct{}{}
+/*
+- O envio fica dentro de um select junto com o canal done. Se a mesa for cancelada
+- (close(done), feito pelo watchdog ao detectar deadlock), o filósofo para de esperar
+- e retorna false, em vez de ficar bloqueado para sempre no envio.
+*/
+
+func pickUp(f Fork, done chan struct{}) bool {
+	select {
+	case f <- struct{}{}:
+		return true
+	case <-done:
+		return false
+	}
 }
 
 // putDown
@@ -35,6 +48,13 @@ func putDown(f Fork) {
 type Metrics struct {
 	meals     int
 	totalWait time.Duration
+	maxWait   time.Duration
+}
+
+// jitter sorteia um tempo uniforme em [d/2, 3d/2]. Com tempos fixos, todos os
+// filósofos andam "em fase" e os dados de fairness ficam artificiais.
+func jitter(rng *rand.Rand, d time.Duration) time.Duration {
+	return d/2 + time.Duration(rng.Int63n(int64(d)+1))
 }
 
 // A Goroutine do Filósofo
@@ -55,14 +75,17 @@ func philosopher(
 	leftIndex, rightIndex int,
 	strategy string,
 	tableLimit chan struct{},
+	done chan struct{},
+	progress *atomic.Int64,
 	wg *sync.WaitGroup,
 	metrics *Metrics,
 ) {
 	defer wg.Done()
+	rng := rand.New(rand.NewSource(int64(id) + 1)) // um gerador por filósofo: sem data race
 
 	for r := 0; r < rounds; r++ {
 		// 1. Pensando
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(jitter(rng, 10*time.Millisecond))
 
 		// Início da medição de espera pelos recursos
 		waitStart := time.Now()
@@ -96,9 +119,13 @@ func philosopher(
 
 		case "deadlock":
 			// Todos pegam esquerda, esperam um instante, tentam direita
-			pickUp(leftFork)
-			time.Sleep(5 * time.Millisecond) // Força o entrelaçamento para desencadear deadlock
-			pickUp(rightFork)
+			if !pickUp(leftFork, done) {
+				return
+			}
+			time.Sleep(20 * time.Millisecond) // Força o entrelaçamento para desencadear deadlock
+			if !pickUp(rightFork, done) {
+				return // mesa cancelada pelo watchdog: sai sem ficar bloqueado
+			}
 
 			/*
 				- Estratégia 2: Hierarchy
@@ -127,8 +154,9 @@ func philosopher(
 			if leftIndex > rightIndex {
 				firstFork, secondFork = rightFork, leftFork
 			}
-			pickUp(firstFork)
-			pickUp(secondFork)
+			if !pickUp(firstFork, done) || !pickUp(secondFork, done) {
+				return
+			}
 
 			/*
 				- Estratégia 3: Conductor
@@ -145,25 +173,36 @@ func philosopher(
 				- tentando comer, PELO MENOS UM FILÓSOFO TERÁ OS DOIS GRAFOS ADJACENTES DISPONÍVEIS,
 				- comerá, soltará os garfos e liberará a mesa para o 5 filósofo entrar.
 				-
-				- Isso elimina a possibilidade de que todos segurem um recurso enquanto esperam
-				- pelo proximo (Hold and Wait global)
+				- Como o único ciclo possível na mesa envolve os N filósofos, ele nunca se fecha:
+				- a condição eliminada é a ESPERA CIRCULAR. A Posse e Espera continua existindo
+				- (o filósofo segura o garfo esquerdo enquanto espera o direito)
 			*/
 		case "conductor":
 			// Limitação de presença à mesa: no máximo N-1 filósofos competindo
-			tableLimit <- struct{}{}
-			pickUp(leftFork)
-			pickUp(rightFork)
+			select {
+			case tableLimit <- struct{}{}:
+			case <-done:
+				return
+			}
+			if !pickUp(leftFork, done) || !pickUp(rightFork, done) {
+				return
+			}
 
 		default:
 			panic("Estratégia desconhecida: " + strategy)
 		}
 
 		// Garfos na mão: contabiliza o tempo de espera e a refeição
-		metrics.totalWait += time.Since(waitStart)
+		wait := time.Since(waitStart)
+		metrics.totalWait += wait
+		if wait > metrics.maxWait {
+			metrics.maxWait = wait
+		}
 		metrics.meals++
+		progress.Add(1) // avisa o watchdog de que a mesa está progredindo
 
 		// 3. Comendo
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(jitter(rng, 10*time.Millisecond))
 
 		// 4. Protocolo de liberação dos garfos
 		putDown(leftFork)
@@ -171,6 +210,32 @@ func philosopher(
 
 		if strategy == "conductor" {
 			<-tableLimit
+		}
+	}
+}
+
+// watchdog
+/*
+- Se nenhuma refeição começar durante 2 segundos, declara deadlock e fecha o canal
+- done. Todos os filósofos bloqueados em pickUp saem do select e retornam, então o
+- programa encerra de forma ordenada, sem o "fatal error" do runtime.
+*/
+
+func watchdog(progress *atomic.Int64, done chan struct{}, finished chan struct{}, deadlock *bool, wg *sync.WaitGroup) {
+	defer wg.Done()
+	last, lastChange := progress.Load(), time.Now()
+	for {
+		select {
+		case <-finished: // todos os filósofos terminaram normalmente
+			return
+		case <-time.After(100 * time.Millisecond):
+			if p := progress.Load(); p != last {
+				last, lastChange = p, time.Now()
+			} else if time.Since(lastChange) > 2*time.Second {
+				*deadlock = true
+				close(done)
+				return
+			}
 		}
 	}
 }
@@ -217,6 +282,15 @@ func main() {
 	// posição id (evita data race)
 	metrics := make([]Metrics, *n)
 
+	done := make(chan struct{})     // fechado pelo watchdog para cancelar a mesa
+	finished := make(chan struct{}) // fechado pelo main quando todos terminam
+	var progress atomic.Int64
+	deadlock := false
+
+	var watchdogWG sync.WaitGroup
+	watchdogWG.Add(1)
+	go watchdog(&progress, done, finished, &deadlock, &watchdogWG)
+
 	var wg sync.WaitGroup
 	wg.Add(*n)
 
@@ -234,23 +308,34 @@ func main() {
 			rightIndex,
 			*strategy,
 			tableLimit,
+			done,
+			&progress,
 			&wg,
 			&metrics[i],
 		)
 	}
 
-	wg.Wait()
+	wg.Wait()         // 1. todos os filósofos retornaram (terminaram ou foram cancelados)
+	close(finished)   // 2. avisa o watchdog
+	watchdogWG.Wait() // 3. espera o watchdog sair: nenhuma goroutine sobra
+
+	if deadlock {
+		fmt.Println("DEADLOCK DETECTADO: nenhum filósofo comeu nos últimos 2s.")
+		fmt.Println("Cada um segura o garfo esquerdo e espera o direito (espera circular).")
+		fmt.Println("A mesa foi cancelada e todas as goroutines encerraram de forma ordenada.")
+		return
+	}
 	fmt.Println("Todos os filósofos concluíram suas refeições com sucesso!")
 
 	// Tabela mastigada para a Pessoa 2 colocar direto no relatório/planilha
 	fmt.Println("=== DADOS DE EXECUÇÃO (FAIRNESS) ===")
-	fmt.Printf("%-12s | %-10s | %-18s\n", "Filósofo ID", "Refeições", "Espera Média")
-	fmt.Println("-------------------------------------------------")
+	fmt.Printf("%-12s | %-10s | %-18s | %-18s\n", "Filósofo ID", "Refeições", "Espera Média", "Espera Máxima")
+	fmt.Println("--------------------------------------------------------------------")
 	for i := 0; i < *n; i++ {
 		avgWait := time.Duration(0)
 		if metrics[i].meals > 0 {
 			avgWait = metrics[i].totalWait / time.Duration(metrics[i].meals)
 		}
-		fmt.Printf("Filósofo %-3d | %-10d | %-18v\n", i, metrics[i].meals, avgWait)
+		fmt.Printf("Filósofo %-3d | %-10d | %-18v | %-18v\n", i, metrics[i].meals, avgWait, metrics[i].maxWait)
 	}
 }

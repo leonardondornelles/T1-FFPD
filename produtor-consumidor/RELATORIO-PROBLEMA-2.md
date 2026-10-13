@@ -199,8 +199,7 @@ LLVM-MinGW (clang 22.1.8, target x86_64-w64-windows-gnu) com `CGO_ENABLED=1`.
 A aprovação do detector cobre os entrelaçamentos que de fato ocorreram nas
 execuções, e não constitui prova de ausência de corridas.
 
-A parte de filósofos permaneceu inalterada; o teste do módulo compila esse pacote,
-mas não exercita seu protocolo.
+A parte de filósofos tem testes próprios (`filosofos/main_test.go`), descritos no relatório final.
 
 ## Uso de IA
 

@@ -47,10 +47,11 @@ func (q *channelQueue) occupancy() int { return len(q.ch) }
 func (q *channelQueue) finish(_ int)   { close(q.ch) }
 
 type config struct {
-	Mode                                          string
+	Mode                                  string
 	K, Producers, Consumers, Items        int
 	ProducerDelay, ConsumerDelay, Timeout time.Duration
 	Occupancy                             bool
+	LogTimeouts                           int // quantos timeouts do consumidor 0 registrar no log
 }
 type result struct {
 	Mode          string       `json:"mode"`
@@ -113,9 +114,15 @@ func run(c config) (result, error) {
 			for {
 				v, ok, expired := q.get(timeout)
 				if expired {
+					// Comportamento alternativo: registra a inatividade e volta a esperar.
+					// Timeout não significa fim da produção, então o consumidor não sai.
 					r.Timeouts[id]++
+					if r.Timeouts[id] <= c.LogTimeouts {
+						fmt.Printf("[consumidor %d] nenhum item em %v (timeout #%d): registrando inatividade e tentando de novo\n",
+							id, timeout, r.Timeouts[id])
+					}
 					continue
-				} // Timeout não significa fim da produção.
+				}
 				if !ok {
 					return
 				}
@@ -187,12 +194,16 @@ func main() {
 	flag.DurationVar(&c.ConsumerDelay, "consumer-delay", 0, "atraso por consumo")
 	flag.DurationVar(&c.Timeout, "timeout", 10*time.Millisecond, "espera do consumidor 0")
 	flag.BoolVar(&c.Occupancy, "occupancy", true, "medir ocupação (desligue para medir throughput sem interferência)")
+	flag.IntVar(&c.LogTimeouts, "log-timeouts", 5, "quantos timeouts do consumidor 0 mostrar no log (0 desliga)")
 	asJSON := flag.Bool("json", false, "resultado JSON")
 	bench := flag.Bool("bench", false, "executa a matriz de experimentos (K=1,10,100 nas duas versões)")
 	benchReps := flag.Int("bench-reps", 5, "repetições por combinação no modo -bench")
 	benchJSONL := flag.String("bench-jsonl", "", "arquivo JSONL com os dados brutos do -bench")
 	flag.Parse()
 
+	if *bench || *asJSON {
+		c.LogTimeouts = 0 // não misturar log com tabela/JSON
+	}
 	if *bench {
 		if err := runBench(c, []string{"channel", "semaphore"}, []int{1, 10, 100}, *benchReps, *benchJSONL, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "Erro:", err)

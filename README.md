@@ -1,15 +1,33 @@
 # T1-FFPD
 
 Trabalho em Go: filósofos (`filosofos/`) e produtor/consumidor (`produtor-consumidor/`).
-A implementação existente dos filósofos foi preservada. O rascunho anterior de
-produtor/consumidor está em `produtor-consumidor/rascunhos/main-original.go.txt`.
+O rascunho anterior de produtor/consumidor está em `produtor-consumidor/rascunhos/`.
+O relatório final é o PDF entregue junto com o código.
 
-## Requisitos e execução
+## Problema 1 — Jantar dos Filósofos
+
+```sh
+go run -race ./filosofos -strategy deadlock                  # demonstra o deadlock e encerra ordenadamente
+go run -race ./filosofos -n 5 -r 200 -strategy hierarchy
+go run -race ./filosofos -n 5 -r 200 -strategy conductor
+```
+
+`-n` é o número de filósofos (padrão 5), `-r` o número de refeições por filósofo
+(padrão 100) e `-strategy` uma de `deadlock`, `hierarchy` ou `conductor`.
+
+Cada garfo é um `chan struct{}` com buffer 1. Pegar o garfo é um `select` entre o envio
+no garfo e o canal `done`; um watchdog fecha `done` se nenhuma refeição começar por 2s.
+Assim a versão `deadlock` detecta o travamento e encerra sem goroutines bloqueadas, em
+vez de abortar com `fatal error`. Os tempos de pensar e comer são sorteados em
+[5, 15] ms (semente fixa por filósofo) para os filósofos não andarem em fase.
+
+## Problema 2 — Produtor/Consumidor
+
+### Requisitos e execução
 
 Go 1.22 ou superior. Sem dependências externas. Execute na raiz do projeto:
 
 ```sh
-go run ./filosofos -strategy hierarchy
 go run ./produtor-consumidor -mode channel -k 10 -p 4 -c 4 -n 2500
 go run ./produtor-consumidor -mode semaphore -k 10 -p 4 -c 4 -n 2500
 go run ./produtor-consumidor -bench -p 4 -c 4 -n 125000
@@ -22,9 +40,9 @@ Também é possível executar `go run produtor-consumidor/main.go`.
 
 - `channel`: channel de itens com capacidade K, fechado somente depois de todos os produtores terminarem. Consumidores drenam o channel e saem ao receber `ok=false`.
 - `semaphore`: buffer circular com semáforos de contagem `notEmpty` (inicialmente 0) e `notFull` (inicialmente K), implementados com canais de permissões, e **dois mutexes independentes** — `mutexIn` serializa os produtores no índice de escrita, `mutexOut` serializa os consumidores no índice de leitura. Produtores e consumidores nunca disputam o mesmo lock. Após a produção, insere uma sentinela por consumidor; cada consumidor sai ao retirar sua sentinela. Os semáforos não são fechados. Implementação em `produtor-consumidor/semaforos.go`.
-- O consumidor 0 usa `select` com `time.After`. Um timeout é contabilizado e a espera recomeça; não encerra o consumidor nem descarta itens.
+- O consumidor 0 usa `select` com `time.After`. Um timeout é contabilizado, registrado no log (as 5 primeiras ocorrências; ajuste com `-log-timeouts`) e a espera recomeça; não encerra o consumidor nem descarta itens.
 
-## Verificação e race detector
+### Verificação e race detector
 
 ```sh
 go test -race ./... -count=1 -timeout=60s
@@ -43,7 +61,7 @@ inválidos/duplicados e o buffer terminar vazio. Falhas retornam código diferen
 Os testes incluem K=1,10,100, múltiplos produtores/consumidores, zero itens,
 menos itens que consumidores, parâmetros inválidos e timeouts seguidos de consumo.
 
-## Métricas e experimentos
+### Métricas e experimentos
 
 A saída inclui tempo, throughput (itens consumidos/segundo), contagem por consumidor,
 timeouts, ocupação média e pico do buffer. `-json` produz um objeto JSON por execução.
@@ -51,7 +69,7 @@ O tempo vai do início da simulação até todos os consumidores terminarem; exc
 verificação final e a compilação, mas inclui criação das goroutines e encerramento.
 A verificação guarda IDs consumidos e usa memória O(p*n), afetando o desempenho.
 
-### Matriz de experimentos
+#### Matriz de experimentos
 
 `-bench` executa as duas versões com K = 1, 10 e 100 e imprime a tabela comparativa:
 
@@ -71,7 +89,7 @@ um tique nesta máquina e o throughput ficaria indefinido; o programa detecta is
 aborta pedindo `-n` maior, em vez de reportar um número inválido. Com 500.000 itens o
 desvio entre repetições fica em 1,5% a 6,5%.
 
-### Ocupação
+#### Ocupação
 
 A ocupação é a **integral do nível do buffer no tempo**, dividida pela duração da
 janela — não uma média de amostras. Cada operação informa o nível resultante ao
