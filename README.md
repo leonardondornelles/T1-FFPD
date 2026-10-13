@@ -1,7 +1,7 @@
 # T1-FFPD
 
 Trabalho em Go: filósofos (`filosofos/`) e produtor/consumidor (`produtor-consumidor/`).
-O relatório final é o PDF entregue junto com o código.
+O relatório está em [`relatorio-t1-fppd-grupo-b.pdf`](relatorio-t1-fppd-grupo-b.pdf).
 
 ## Requisitos
 
